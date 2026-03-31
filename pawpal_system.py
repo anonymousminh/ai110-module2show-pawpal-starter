@@ -1,7 +1,18 @@
+import datetime
 from typing import Optional
 
 PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
 TIME_SLOT_ORDER = {"morning": 0, "afternoon": 1, "evening": 2}
+_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday"}
+_WEEKENDS = {"saturday", "sunday"}
+
+# How far ahead to push a recurring task when it is marked complete.
+_RECURRENCE_DELTA: dict[str, datetime.timedelta] = {
+    "daily":    datetime.timedelta(days=1),
+    "weekdays": datetime.timedelta(days=1),
+    "weekends": datetime.timedelta(days=1),
+    "weekly":   datetime.timedelta(weeks=1),
+}
 
 
 class Task:
@@ -11,12 +22,15 @@ class Task:
         duration_minutes: int,
         priority: str,
         preferred_time: Optional[str] = None,
+        due_date: Optional[datetime.date] = None,
     ):
-        """Create a task with a title, duration, priority, and optional preferred time slot."""
+        """Create a task with a title, duration, priority, optional preferred time slot,
+        and optional due date."""
         self.title = title
         self.duration_minutes = duration_minutes
         self.priority = priority
         self.preferred_time = preferred_time
+        self.due_date: Optional[datetime.date] = due_date
         self.completed: bool = False
 
     def mark_complete(self) -> None:
@@ -28,8 +42,94 @@ class Task:
         return PRIORITY_RANK.get(self.priority, 0)
 
     def __repr__(self) -> str:
-        """Return a concise string representation of the task."""
-        return f"Task({self.title!r}, {self.duration_minutes}min, {self.priority})"
+        due = f", due={self.due_date}" if self.due_date else ""
+        return f"Task({self.title!r}, {self.duration_minutes}min, {self.priority}{due})"
+
+
+class RecurringTask(Task):
+    """A Task that repeats on a defined cadence (daily, weekdays, weekends, weekly)."""
+
+    VALID_RECURRENCES = {"daily", "weekdays", "weekends", "weekly"}
+
+    def __init__(
+        self,
+        title: str,
+        duration_minutes: int,
+        priority: str,
+        recurrence: str,
+        preferred_time: Optional[str] = None,
+        due_date: Optional[datetime.date] = None,
+    ):
+        """Create a recurring task.
+
+        Args:
+            title: Human-readable name of the task.
+            duration_minutes: How long the task takes.
+            priority: One of 'high', 'medium', or 'low'.
+            recurrence: Cadence — must be one of VALID_RECURRENCES
+                ('daily', 'weekdays', 'weekends', 'weekly').
+            preferred_time: Optional slot hint ('morning', 'afternoon', 'evening').
+            due_date: The date this occurrence is due; used as the base when
+                computing the next due date in mark_complete().
+
+        Raises:
+            ValueError: If recurrence is not one of VALID_RECURRENCES.
+        """
+        if recurrence not in self.VALID_RECURRENCES:
+            raise ValueError(f"recurrence must be one of {self.VALID_RECURRENCES}")
+        super().__init__(title, duration_minutes, priority, preferred_time, due_date)
+        self.recurrence = recurrence
+
+    def mark_complete(self) -> "RecurringTask":
+        """Mark this occurrence complete and return a new RecurringTask for the next one.
+
+        The next due date is calculated with timedelta so the caller can store or
+        schedule it without any extra date arithmetic:
+            daily / weekdays / weekends → today + 1 day
+            weekly                      → today + 7 days
+        """
+        super().mark_complete()
+        delta = _RECURRENCE_DELTA[self.recurrence]
+        next_due = (self.due_date or datetime.date.today()) + delta
+        return RecurringTask(
+            title=self.title,
+            duration_minutes=self.duration_minutes,
+            priority=self.priority,
+            recurrence=self.recurrence,
+            preferred_time=self.preferred_time,
+            due_date=next_due,
+        )
+
+    def is_active_today(self, day_of_week: str) -> bool:
+        """Return True if this task should run on the given day of the week.
+
+        Args:
+            day_of_week: Full weekday name, case-insensitive (e.g. 'Tuesday').
+
+        Returns:
+            True when the recurrence cadence includes that day:
+                'daily'    → always True
+                'weekdays' → Monday–Friday
+                'weekends' → Saturday–Sunday
+                'weekly'   → Monday only
+        """
+        day = day_of_week.lower()
+        if self.recurrence == "daily":
+            return True
+        if self.recurrence == "weekdays":
+            return day in _WEEKDAYS
+        if self.recurrence == "weekends":
+            return day in _WEEKENDS
+        if self.recurrence == "weekly":
+            return day == "monday"
+        return False
+
+    def __repr__(self) -> str:
+        due = f", due={self.due_date}" if self.due_date else ""
+        return (
+            f"RecurringTask({self.title!r}, {self.duration_minutes}min, "
+            f"{self.priority}, recurrence={self.recurrence!r}{due})"
+        )
 
 
 class Pet:
@@ -131,6 +231,46 @@ class Scheduler:
         parts.append(f"takes {task.duration_minutes} min")
         return "; ".join(parts)
 
+    def sort_by_time(self) -> list[ScheduledTask]:
+        """Return the scheduled entries sorted by start time (earliest first).
+
+        Uses a lambda key on ``start_minute`` so the result is always in true
+        chronological order, independent of the order tasks were inserted or
+        the slot-based ordering used by generate_schedule().
+
+        Returns:
+            A new sorted list of ScheduledTask objects; self.scheduled is unchanged.
+        """
+        return sorted(self.scheduled, key=lambda e: e.start_minute)
+
+    def filter_by_status(self, completed: bool) -> list[ScheduledTask]:
+        """Return only entries whose underlying task matches the given completion status.
+
+        Args:
+            completed: Pass True to get finished tasks, False to get pending ones.
+
+        Returns:
+            A filtered list of ScheduledTask objects from self.scheduled.
+        """
+        return [e for e in self.scheduled if e.task.completed == completed]
+
+    @staticmethod
+    def detect_conflicts(entries: list[ScheduledTask]) -> list[tuple[ScheduledTask, ScheduledTask]]:
+        """Find pairs of scheduled tasks whose time windows overlap.
+
+        Pass entries from one or more schedulers combined to detect double-booking
+        across pets.  Two entries conflict when one starts before the other ends:
+            a.start < b.end  AND  b.start < a.end
+        """
+        sorted_entries = sorted(entries, key=lambda e: e.start_minute)
+        conflicts: list[tuple[ScheduledTask, ScheduledTask]] = []
+        for i, a in enumerate(sorted_entries):
+            for b in sorted_entries[i + 1:]:
+                if b.start_minute >= a.end_minute:
+                    break  # list is sorted; nothing after b can overlap a
+                conflicts.append((a, b))
+        return conflicts
+
     def explain_plan(self) -> str:
         """Return a formatted summary of the schedule, including dropped tasks and time budget."""
         if not self.scheduled:
@@ -160,3 +300,15 @@ class Scheduler:
                 lines.append(f"  - {task.title}: {reason}")
 
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def filter_by_pet(
+    entries: list[tuple["Pet", ScheduledTask]], pet_name: str
+) -> list[ScheduledTask]:
+    """From a combined multi-pet list of (Pet, ScheduledTask) pairs, return
+    only the entries belonging to the named pet."""
+    return [entry for pet, entry in entries if pet.name == pet_name]
